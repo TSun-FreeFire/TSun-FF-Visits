@@ -2,6 +2,7 @@ from flask import Flask, jsonify
 import aiohttp
 import asyncio
 import json
+import os
 from byte import encrypt_api, Encrypt_ID
 from visit_count_pb2 import Info  # Import the generated protobuf class
 
@@ -9,13 +10,15 @@ app = Flask(__name__)
 
 async def load_tokens(server_name):
     try:
-        base_url = "https://raw.githubusercontent.com/TSun-FreeFire/TSun-FF-Backup/main/PK/"
+        base_url = os.getenv("TOKEN_BASE_URL")
+        if not base_url:
+            raise ValueError("TOKEN_BASE_URL environment variable is not set.")
         if server_name == "PK":
-            path = "token_PK.json"
+            path = "PK/token_PK.json"
         elif server_name in {"BR", "US", "SAC", "NA"}:
-            path = "token_BR.json"
+            path = "BR/token_BR.json"
         else:
-            path = "token_BD.json"
+            path = "BD/token_BD.json"
 
         url = base_url + path
         
