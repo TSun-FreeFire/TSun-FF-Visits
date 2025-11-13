@@ -8,6 +8,10 @@ from visit_count_pb2 import Info  # Import the generated protobuf class
 
 app = Flask(__name__)
 
+@app.route('/favicon.ico')
+def favicon():
+    return '', 204
+
 async def load_tokens(server_name):
     try:
         base_url = os.getenv("TOKEN_BASE_URL")
