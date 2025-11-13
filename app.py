@@ -122,7 +122,7 @@ async def send_until_1000_success(tokens, uid, server_name, target_success=1000)
 def send_visits(server, uid):
     server = server.upper()
     tokens = asyncio.run(load_tokens(server))
-    target_success = len(tokens)
+    target_success = len(tokens) # Set target_success to the number of available tokens
 
     if not tokens:
         return jsonify({"error": "❌ No valid tokens found"}), 500
