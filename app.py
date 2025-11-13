@@ -83,23 +83,24 @@ async def visit(session, url, token, uid, data):
         app.logger.error(f"❌ Visit error: {e}")
         return False, None
 
-async def send_until_1000_success(tokens, uid, server_name, target_success=1000):
+async def send_visits_in_batches(tokens, uid, server_name):
     url = get_url(server_name)
     connector = aiohttp.TCPConnector(limit=0)
     total_success = 0
     total_sent = 0
     first_success_response = None
     player_info = None
-
+    batch_size = 100
+    
     async with aiohttp.ClientSession(connector=connector) as session:
         encrypted = encrypt_api("08" + Encrypt_ID(str(uid)) + "1801")
         data = bytes.fromhex(encrypted)
 
-        while total_success < target_success:
-            batch_size = min(target_success - total_success, 1000)
+        for i in range(0, len(tokens), batch_size):
+            current_batch_tokens = tokens[i:i + batch_size]
             tasks = [
-                asyncio.create_task(visit(session, url, tokens[(total_sent + i) % len(tokens)], uid, data))
-                for i in range(batch_size)
+                asyncio.create_task(visit(session, url, token, uid, data))
+                for token in current_batch_tokens
             ]
             results = await asyncio.gather(*tasks)
             
@@ -112,9 +113,14 @@ async def send_until_1000_success(tokens, uid, server_name, target_success=1000)
             
             batch_success = sum(1 for r, _ in results if r)
             total_success += batch_success
-            total_sent += batch_size
+            total_sent += len(current_batch_tokens)
 
-            print(f"Batch sent: {batch_size}, Success in batch: {batch_success}, Total success so far: {total_success}")
+            print(f"Batch sent: {len(current_batch_tokens)}, Success in batch: {batch_success}, Total success so far: {total_success}")
+            
+            if batch_success > 0:
+                print("Successfully sent a batch, sending next batch...")
+            else:
+                print("No success in this batch, continuing to next batch...")
 
     return total_success, total_sent, player_info
 
@@ -130,9 +136,8 @@ def send_visits(server, uid):
     print(f"🚀 Sending visits to UID: {uid} using {len(tokens)} tokens")
     print(f"Waiting for total {target_success} successful visits...")
 
-    total_success, total_sent, player_info = asyncio.run(send_until_1000_success(
-        tokens, uid, server,
-        target_success=target_success
+    total_success, total_sent, player_info = asyncio.run(send_visits_in_batches(
+        tokens, uid, server
     ))
 
     if player_info:
