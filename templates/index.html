@@ -650,6 +650,9 @@
         };
 
         const renderVisitResponse = (data, isError = false) => {
+            welcomeScreen.classList.add('hidden');
+            loader.classList.add('hidden');
+            resultPanel.classList.remove('hidden');
             infoResponsePanel.classList.add('hidden');
             infoStatsGrid.classList.add('hidden');
             infoDetailsGrid.classList.add('hidden');
@@ -747,7 +750,10 @@
 
             visitBtn.disabled = true;
             visitBtn.innerText = 'EXECUTING_STRIKE...';
-            
+            welcomeScreen.classList.add('hidden');
+            resultPanel.classList.add('hidden');
+            loader.classList.remove('hidden');
+
             try {
                 const response = await fetch(`/visit/${encodeURIComponent(server)}/${encodeURIComponent(uid)}`);
                 const data = await response.json();
