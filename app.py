@@ -1,3 +1,11 @@
+# IMPORTANT: gevent monkey-patching MUST happen before any other import that
+# touches networking/ssl (flask, aiohttp, asyncio, etc.). Gunicorn with
+# preload_app=True imports this module in the master process before the gevent
+# worker patches, so we patch here at the absolute top to guarantee ordering.
+from gevent import monkey
+
+monkey.patch_all()
+
 import asyncio
 import json
 import logging
