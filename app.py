@@ -19,6 +19,21 @@ except ImportError:
 
 AccountPersonalShowInfo = getattr(AccountPersonalShow_pb2, "AccountPersonalShowInfo")
 
+# --- Remote configuration (fetched from gist on every call, never cached) ---
+CONFIG_URL = "https://gist.githubusercontent.com/SaeedX302/b8277fdd6a2e71b599a39299f3ab3545/raw/config.json"
+
+async def fetch_config():
+    """Fetch config.json fresh from the remote gist on every call (no caching)."""
+    async with aiohttp.ClientSession() as session:
+        async with session.get(CONFIG_URL) as resp:
+            resp.raise_for_status()
+            # Force JSON decode even if served as text/plain
+            return json.loads(await resp.text())
+
+def fetch_config_sync():
+    """Synchronous wrapper for use inside Flask route handlers."""
+    return asyncio.run(fetch_config())
+
 app = Flask(__name__, static_folder="assets", static_url_path="/assets")
 APP_START_TIME = time.monotonic()
 
@@ -30,6 +45,17 @@ def home():
 def health_check():
     uptime_seconds = round(time.monotonic() - APP_START_TIME, 3)
     return jsonify({"status": "ok", "uptime_seconds": uptime_seconds}), 200
+
+@app.route('/config', methods=['GET'])
+def config_info():
+    """Expose public-facing config values fetched live from the gist."""
+    config = fetch_config_sync()
+    return jsonify({
+        "version": config.get("version"),
+        "release_version": config.get("RELEASEVERSION"),
+        "next_update": config.get("next_update"),
+        "owner": config.get("owner"),
+    }), 200
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -75,15 +101,17 @@ async def load_tokens(server_name):
         logger.error(f"❌ Token load error for {server_name}: {e}")
         return []
 
-def get_url(server_name):
-    if server_name == "PK":
-        return "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow"
-    elif server_name == "IND":
-        return "https://client.ind.freefiremobile.com/GetPlayerPersonalShow"
+def get_url(server_name, config):
+    # Base client URLs come from the remote config -> client_url
+    client_url = config.get("client_url", {})
+    if server_name == "IND":
+        base = client_url.get("ind", "https://client.ind.freefiremobile.com/")
     elif server_name in {"BR", "US", "SAC", "NA"}:
-        return "https://client.us.freefiremobile.com/GetPlayerPersonalShow"
+        base = client_url.get("us", "https://client.us.freefiremobile.com/")
     else:
-        return "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow"
+        # PK and all other regions use the global endpoint
+        base = client_url.get("global", "https://clientbp.ggpolarbear.com/")
+    return base.rstrip("/") + "/GetPlayerPersonalShow"
 
 def parse_basic_protobuf_response(response_data):
     # This is the lighter parsing used during mass visits
@@ -104,9 +132,9 @@ def parse_basic_protobuf_response(response_data):
         logger.error(f"❌ Protobuf parsing error: {e}")
         return None
 
-async def visit(session, url, token, uid, data):
+async def visit(session, url, token, uid, data, release_version):
     headers = {
-        "ReleaseVersion": "OB53",
+        "ReleaseVersion": release_version,
         "X-GA": "v1 1",
         "Authorization": f"Bearer {token}",
         "Host": url.replace("https://", "").split("/")[0]
@@ -122,8 +150,9 @@ async def visit(session, url, token, uid, data):
         logger.error(f"❌ Visit error: {e}")
         return False, None
 
-async def send_visits_in_batches(tokens, uid, server_name):
-    url = get_url(server_name)
+async def send_visits_in_batches(tokens, uid, server_name, config):
+    url = get_url(server_name, config)
+    release_version = config.get("RELEASEVERSION", "OB54")
     connector = aiohttp.TCPConnector(limit=0)
     total_success = 0
     total_sent = 0
@@ -145,7 +174,7 @@ async def send_visits_in_batches(tokens, uid, server_name):
         for i in range(0, len(tokens), batch_size):
             current_batch_tokens = tokens[i:i + batch_size]
             tasks = [
-                asyncio.create_task(visit(session, url, token, uid, data))
+                asyncio.create_task(visit(session, url, token, uid, data, release_version))
                 for token in current_batch_tokens
             ]
             results = await asyncio.gather(*tasks)
@@ -213,8 +242,11 @@ def format_timestamps_in_dict(data_dict, region):
              new_dict[k] = v
     return new_dict
 
-async def fetch_player_data(uid, server, tokens=None):
-    url = get_url(server)
+async def fetch_player_data(uid, server, tokens=None, config=None):
+    if config is None:
+        config = await fetch_config()
+    url = get_url(server, config)
+    release_version = config.get("RELEASEVERSION", "OB54")
     if not tokens:
         tokens = await load_tokens(server)
     if not tokens:
@@ -240,7 +272,7 @@ async def fetch_player_data(uid, server, tokens=None):
     
     for i, token in enumerate(tokens_to_try):
         headers = {
-            "ReleaseVersion": "OB53",
+            "ReleaseVersion": release_version,
             "X-GA": "v1 1",
             "Authorization": f"Bearer {token}",
             "Host": url.replace("https://", "").split("/")[0],
@@ -389,11 +421,11 @@ def get_player_info(server, uid):
     else:
         return jsonify({"error": "Invalid UID or Server (Check UID and Server)"}), 404
 
-async def background_visit_task(tokens, uid, server):
+async def background_visit_task(tokens, uid, server, config):
     """Runs the visit batch 5 times in the background."""
     for i in range(5):
         logger.info(f"Starting background visit run {i+1}/5 for UID {uid}")
-        await send_visits_in_batches(tokens, uid, server)
+        await send_visits_in_batches(tokens, uid, server, config)
         # Optional: Add small delay between runs if needed
         # await asyncio.sleep(1)
 
@@ -409,16 +441,19 @@ def send_visits_endpoint(server, uid):
 
     token_count = len(tokens)
     projected_success = token_count * 5
-    
+
+    # Fetch the remote config once for this request (used by pre-fetch + background visits)
+    config = fetch_config_sync()
+
     # Fetch player info BEFORE starting visits to provide better UX
     # Default values in case fetch fails
     real_nickname = "Processing..."
     real_level = 0
     real_likes = 0
-    
+
     try:
         # Use the tokens we already loaded
-        binary_data = asyncio.run(fetch_player_data(uid, server, tokens=tokens))
+        binary_data = asyncio.run(fetch_player_data(uid, server, tokens=tokens, config=config))
         if binary_data:
             player_info = parse_basic_protobuf_response(binary_data)
             if player_info:
@@ -435,7 +470,7 @@ def send_visits_endpoint(server, uid):
     def run_async_background():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(background_visit_task(tokens, uid, server))
+        loop.run_until_complete(background_visit_task(tokens, uid, server, config))
         loop.close()
 
     # Start the background thread
