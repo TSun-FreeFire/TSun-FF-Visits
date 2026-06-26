@@ -255,6 +255,7 @@
                     <div>
                         <label class="block mono text-[10px] text-white/40 mb-1 uppercase tracking-widest">Visit Region</label>
                         <select id="visitRegion" class="w-full tactical-input p-3 mono text-sm uppercase tracking-widest">
+                            <option value="" selected disabled>SELECT REGION</option>
                             <option value="BD">BD</option>
                             <option value="IND">IND</option>
                             <option value="ME">ME</option>
@@ -265,7 +266,7 @@
                             <option value="SAC">SAC</option>
                         </select>
                     </div>
-                    <button id="visitBtn" type="submit" class="w-full py-3 border border-cyan-500/30 text-cyan-500 bebas text-xl hover:bg-cyan-500/10 transition-all">
+                    <button id="visitBtn" type="submit" disabled class="w-full py-3 border border-cyan-500/30 text-cyan-500 bebas text-xl hover:bg-cyan-500/10 transition-all disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent">
                         SEND VISITS
                     </button>
                 </form>
@@ -552,6 +553,11 @@
         const visitResponsePanel = document.getElementById('visitResponsePanel');
         let lastAvatarId = null;
 
+        // Enable SEND VISITS only after a Visit Region is selected
+        const syncVisitBtn = () => { visitBtn.disabled = !visitRegion.value; };
+        visitRegion.addEventListener('change', syncVisitBtn);
+        syncVisitBtn();
+
         // Modal Logic
         const modalContainer = document.getElementById('modalContainer');
         const modals = {
@@ -735,6 +741,7 @@
             e.preventDefault();
             const uid = visitUid.value.trim();
             if(!uid) return notify('TARGET_UID_REQUIRED', 'error');
+            if(!visitRegion.value) return notify('VISIT_REGION_REQUIRED', 'error');
 
             const server = mapVisitServer(visitRegion.value);
 
@@ -750,8 +757,8 @@
                 renderVisitResponse({ error: err.message, message: 'PACKET LOSS DETECTED' }, true);
                 notify('PACKET_LOSS_DETECTED', 'error');
             } finally {
-                visitBtn.disabled = false;
                 visitBtn.innerText = 'INITIATE VISIT_STRIKE';
+                syncVisitBtn();
             }
         };
     </script>
