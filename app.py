@@ -6,15 +6,17 @@ from gevent import monkey
 
 monkey.patch_all()
 
-import asyncio
 import json
 import logging
+import ssl
 import sys
 import time
+import urllib.request
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, render_template
 
-import aiohttp
+from gevent.pool import Pool
+
 from byte import encrypt_api, Encrypt_ID
 from google.protobuf import json_format
 
@@ -27,20 +29,41 @@ except ImportError:
 
 AccountPersonalShowInfo = getattr(AccountPersonalShow_pb2, "AccountPersonalShowInfo")
 
-# --- Remote configuration (fetched from gist on every call, never cached) ---
+# --- Remote configuration (fetched from gist) ---
 CONFIG_URL = "https://gist.githubusercontent.com/SaeedX302/b8277fdd6a2e71b599a39299f3ab3545/raw/config.json"
+CONFIG_TIMEOUT = 15  # seconds — fail fast instead of waiting 300s
 
-async def fetch_config():
-    """Fetch config.json fresh from the remote gist on every call (no caching)."""
-    async with aiohttp.ClientSession() as session:
-        async with session.get(CONFIG_URL) as resp:
-            resp.raise_for_status()
-            # Force JSON decode even if served as text/plain
-            return json.loads(await resp.text())
+# Module-level cache so we don't hammer the gist on every request
+_cached_config = None
+_config_cache_time = 0
+_CONFIG_CACHE_TTL = 60  # seconds
+
+def fetch_config():
+    """Fetch config.json from the remote gist (synchronous, gevent-friendly)."""
+    req = urllib.request.Request(CONFIG_URL, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=CONFIG_TIMEOUT) as resp:
+        return json.loads(resp.read().decode())
 
 def fetch_config_sync():
-    """Synchronous wrapper for use inside Flask route handlers."""
-    return asyncio.run(fetch_config())
+    """Synchronous wrapper for use inside Flask route handlers.
+
+    Tries the remote gist first, then falls back to a recent cached config.
+    Raises if the gist is unreachable and no usable cache exists.
+    """
+    global _cached_config, _config_cache_time
+    try:
+        config = fetch_config()
+        _cached_config = config
+        _config_cache_time = time.monotonic()
+        return config
+    except Exception as e:
+        logger.warning(f"⚠️ fetch_config failed: {e}")
+        if _cached_config is not None:
+            age = time.monotonic() - _config_cache_time
+            if age < _CONFIG_CACHE_TTL * 10:  # allow stale cache for up to 10x TTL
+                logger.info(f"Using cached config (age={age:.1f}s)")
+                return _cached_config
+        raise
 
 app = Flask(__name__, static_folder="assets", static_url_path="/assets")
 APP_START_TIME = time.monotonic()
@@ -57,7 +80,10 @@ def health_check():
 @app.route('/config', methods=['GET'])
 def config_info():
     """Expose public-facing config values fetched live from the gist."""
-    config = fetch_config_sync()
+    try:
+        config = fetch_config_sync()
+    except Exception as e:
+        return jsonify({"error": "Config service unavailable", "detail": str(e)}), 503
     return jsonify({
         "version": config.get("version"),
         "release_version": config.get("RELEASEVERSION"),
@@ -77,7 +103,7 @@ REGION_OFFSETS = {
 
 # --- Helper Functions (Previously in tsunxkitten.py) ---
 
-async def load_tokens(server_name):
+def load_tokens(server_name):
     try:
         base_url = "https://raw.githubusercontent.com/TSun-FreeFire/TSun-FreeFire-Storage/main/Spam-api/"
         
@@ -95,18 +121,34 @@ async def load_tokens(server_name):
         file_name = server_map.get(server_name, "token_bd.json")
         url = base_url + file_name
         
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    # Force decode as JSON, even if mimetype is text/plain
-                    data = json.loads(await resp.text())
-                    tokens = [item["token"] for item in data if "token" in item and item["token"] not in ["", "N/A"]]
-                    return tokens
-                else:
-                    logger.error(f"❌ Failed to fetch tokens from {url}: Status {resp.status}")
-                    return []
+        ssl_ctx = ssl._create_unverified_context()
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15, context=ssl_ctx) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode())
+                tokens = [item["token"] for item in data if "token" in item and item["token"] not in ["", "N/A"]]
+                return tokens
+            else:
+                logger.error(f"❌ Failed to fetch tokens from {url}: Status {resp.status}")
+                return _load_local_tokens(server_name)
     except Exception as e:
         logger.error(f"❌ Token load error for {server_name}: {e}")
+        return _load_local_tokens(server_name)
+
+def _load_local_tokens(server_name):
+    """Fall back to the local token_bd.json file when remote fetch fails."""
+    local_files = {
+        "BD": "token_bd.json",
+    }
+    file_name = local_files.get(server_name, "token_bd.json")
+    try:
+        with open(file_name, "r") as f:
+            data = json.load(f)
+        tokens = [item["token"] for item in data if "token" in item and item["token"] not in ["", "N/A"]]
+        logger.info(f"Loaded {len(tokens)} tokens from local file {file_name}")
+        return tokens
+    except Exception as e:
+        logger.error(f"❌ Local token file load failed: {e}")
         return []
 
 def get_url(server_name, config):
@@ -140,67 +182,72 @@ def parse_basic_protobuf_response(response_data):
         logger.error(f"❌ Protobuf parsing error: {e}")
         return None
 
-async def visit(session, url, token, uid, data, release_version):
+def http_post(url, headers, data, timeout=30):
+    """Synchronous HTTP POST using urllib (gevent-compatible)."""
+    ssl_ctx = ssl._create_unverified_context()
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout, context=ssl_ctx) as resp:
+        return resp.status, resp.read()
+
+def visit(url, token, uid, data, release_version, index=0):
     headers = {
         "ReleaseVersion": release_version,
         "X-GA": "v1 1",
         "Authorization": f"Bearer {token}",
-        "Host": url.replace("https://", "").split("/")[0]
+        "Host": url.replace("https://", "").split("/")[0],
+        "Content-Type": "application/octet-stream",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 15; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.7499.146 Mobile Safari/537.36"
     }
     try:
-        async with session.post(url, headers=headers, data=data, ssl=False) as resp:
-            if resp.status == 200:
-                response_data = await resp.read()
-                return True, response_data
-            else:
-                return False, None
+        status, body = http_post(url, headers, data)
+        if status == 200:
+            return True, body
+        elif status == 429:
+            logger.warning(f"Token {index} rate limited (429). Trying next token...")
+        else:
+            logger.warning(f"Token {index} failed with status {status}. Trying next token...")
+        return False, None
     except Exception as e:
         logger.error(f"❌ Visit error: {e}")
         return False, None
 
-async def send_visits_in_batches(tokens, uid, server_name, config):
+def send_visits_in_batches(tokens, uid, server_name, config):
     url = get_url(server_name, config)
     release_version = config.get("RELEASEVERSION", "OB54")
-    connector = aiohttp.TCPConnector(limit=0)
     total_success = 0
     total_sent = 0
     first_success_response = None
     player_info = None
     batch_size = 100
-    
-    async with aiohttp.ClientSession(connector=connector) as session:
-        # Generate encrypted payload for the visit
-        try:
-           encrypted_id = Encrypt_ID(str(uid))
-           if encrypted_id is None:
-               raise ValueError("Unable to encrypt UID")
-           encrypted = encrypt_api(f"08{encrypted_id}1801")
-           data = bytes.fromhex(encrypted)
-        except Exception:
-           return 0, 0, None # Fail gracefully if encryption fails
 
-        for i in range(0, len(tokens), batch_size):
-            current_batch_tokens = tokens[i:i + batch_size]
-            tasks = [
-                asyncio.create_task(visit(session, url, token, uid, data, release_version))
-                for token in current_batch_tokens
-            ]
-            results = await asyncio.gather(*tasks)
-            
-            if first_success_response is None:
-                for success, response in results:
-                    if success and response is not None:
-                        first_success_response = response
-                        # Parse basic info from the first successful hit
-                        player_info = parse_basic_protobuf_response(response)
-                        break
-            
-            batch_success = sum(1 for r, _ in results if r)
-            total_success += batch_success
-            total_sent += len(current_batch_tokens)
-            
-            # Simple logging or removed to be quieter
-            # print(f"Batch sent... Success: {batch_success}")
+    # Generate encrypted payload for the visit
+    try:
+        encrypted_id = Encrypt_ID(str(uid))
+        if encrypted_id is None:
+            raise ValueError("Unable to encrypt UID")
+        encrypted = encrypt_api(f"08{encrypted_id}1801")
+        data = bytes.fromhex(encrypted)
+    except Exception:
+        return 0, 0, None  # Fail gracefully if encryption fails
+
+    pool = Pool(100)
+    for i in range(0, len(tokens), batch_size):
+        current_batch_tokens = tokens[i:i + batch_size]
+        results = pool.map(
+            lambda token: visit(url, token, uid, data, release_version),
+            current_batch_tokens,
+        )
+
+        if first_success_response is None:
+            for success, response in results:
+                if success and response is not None:
+                    first_success_response = response
+                    player_info = parse_basic_protobuf_response(response)
+                    break
+
+        batch_success = sum(1 for r, _ in results if r)
+        total_success += batch_success
+        total_sent += len(current_batch_tokens)
 
     return total_success, total_sent, player_info
 
@@ -250,17 +297,28 @@ def format_timestamps_in_dict(data_dict, region):
              new_dict[k] = v
     return new_dict
 
-async def fetch_player_data(uid, server, tokens=None, config=None):
+def fetch_player_data(uid, server, tokens=None, config=None):
     if config is None:
-        config = await fetch_config()
+        try:
+            config = fetch_config()
+            global _cached_config, _config_cache_time
+            _cached_config = config
+            _config_cache_time = time.monotonic()
+        except Exception as e:
+            logger.warning(f"Config fetch failed: {e}")
+            if _cached_config is not None:
+                logger.info("Using cached config as fallback")
+                config = _cached_config
+            else:
+                raise
     url = get_url(server, config)
     release_version = config.get("RELEASEVERSION", "OB54")
     if not tokens:
-        tokens = await load_tokens(server)
+        tokens = load_tokens(server)
     if not tokens:
         logger.error(f"No tokens found for server {server}")
         return None
-    
+
     # Payload matches app.py logic
     # We continue to use the byte.py encryption for request generation as it works
     try:
@@ -271,14 +329,17 @@ async def fetch_player_data(uid, server, tokens=None, config=None):
     except Exception as e:
         logger.error(f"Failed to encrypt UID {uid}: {e}")
         return None
-        
+
     data_bytes = bytes.fromhex(encrypted)
-    
+
     # Try first 3 tokens
     max_attempts = 3
     tokens_to_try = tokens[:max_attempts]
-    
+
     for i, token in enumerate(tokens_to_try):
+        if i > 0:
+            time.sleep(0.5)
+
         headers = {
             "ReleaseVersion": release_version,
             "X-GA": "v1 1",
@@ -288,23 +349,18 @@ async def fetch_player_data(uid, server, tokens=None, config=None):
             "User-Agent": "Mozilla/5.0 (Linux; Android 15; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.7499.146 Mobile Safari/537.36"
         }
 
-        async with aiohttp.ClientSession() as session:
-            try:
-                if i > 0:
-                    await asyncio.sleep(0.5)
-                    
-                async with session.post(url, headers=headers, data=data_bytes, ssl=False) as resp:
-                    if resp.status == 200:
-                        response_data = await resp.read()
-                        print(f"Success with token index {i}")
-                        return response_data
-                    elif resp.status == 429:
-                        logger.warning(f"Token {i} rate limited (429). Trying next token...")
-                    else:
-                        logger.warning(f"Token {i} failed with status {resp.status}. Trying next token...")
-            except Exception as e:
-                logger.error(f"Error fetching data with token {i}: {e}")
-                
+        try:
+            status, body = http_post(url, headers, data_bytes, timeout=30)
+            if status == 200:
+                print(f"Success with token index {i}")
+                return body
+            elif status == 429:
+                logger.warning(f"Token {i} rate limited (429). Trying next token...")
+            else:
+                logger.warning(f"Token {i} failed with status {status}. Trying next token...")
+        except Exception as e:
+            logger.error(f"Error fetching data with token {i}: {e}")
+
     logger.error("All attempts failed. The UID might be incorrect.")
     return None
 
@@ -400,7 +456,11 @@ def get_player_info_auto(uid):
     
     for server in servers_to_try:
         print(f"Trying server: {server}...")
-        binary_data = asyncio.run(fetch_player_data(uid, server))
+        try:
+            binary_data = fetch_player_data(uid, server)
+        except Exception as e:
+            logger.warning(f"fetch_player_data crashed for {uid}/{server}: {e}")
+            continue
         
         if binary_data:
             print(f"Fetch successful on server: {server}. Processing with Schema...")
@@ -416,8 +476,12 @@ def get_player_info(server, uid):
     server = server.upper()
     print(f"Fetching info for UID: {uid} on Server: {server}...")
     
-    # Run the async fetch logic safely within the sync route using asyncio.run
-    binary_data = asyncio.run(fetch_player_data(uid, server))
+    # Fetch the player data synchronously (urllib is gevent-compatible)
+    try:
+        binary_data = fetch_player_data(uid, server)
+    except Exception as e:
+        logger.error(f"fetch_player_data crashed for {uid}/{server}: {e}")
+        return jsonify({"error": "Service temporarily unavailable. Please try again.", "detail": str(e)}), 503
     
     if binary_data:
         print("Fetch successful. Processing with Schema...")
@@ -429,20 +493,18 @@ def get_player_info(server, uid):
     else:
         return jsonify({"error": "Invalid UID or Server (Check UID and Server)"}), 404
 
-async def background_visit_task(tokens, uid, server, config):
+def background_visit_task(tokens, uid, server, config):
     """Runs the visit batch 5 times in the background."""
     for i in range(5):
         logger.info(f"Starting background visit run {i+1}/5 for UID {uid}")
-        await send_visits_in_batches(tokens, uid, server, config)
-        # Optional: Add small delay between runs if needed
-        # await asyncio.sleep(1)
+        send_visits_in_batches(tokens, uid, server, config)
 
 @app.route('/visit/<string:server>/<int:uid>', methods=['GET'])
 def send_visits_endpoint(server, uid):
     server = server.upper()
     
     # Run the initial token load
-    tokens = asyncio.run(load_tokens(server))
+    tokens = load_tokens(server)
     
     if not tokens:
         return jsonify({"error": "❌ No valid tokens found"}), 500
@@ -461,7 +523,7 @@ def send_visits_endpoint(server, uid):
 
     try:
         # Use the tokens we already loaded
-        binary_data = asyncio.run(fetch_player_data(uid, server, tokens=tokens, config=config))
+        binary_data = fetch_player_data(uid, server, tokens=tokens, config=config)
         if binary_data:
             player_info = parse_basic_protobuf_response(binary_data)
             if player_info:
@@ -473,18 +535,10 @@ def send_visits_endpoint(server, uid):
 
     print(f"🚀 Triggering 5x visits for UID: {uid}. Tokens: {token_count}. Projected Outcome: {projected_success}")
 
-    # Helper function to run the background task in a new event loop
-    # because Flask's dev server is synchronous
-    def run_async_background():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(background_visit_task(tokens, uid, server, config))
-        loop.close()
-
     # Start the background thread
     import threading
-    thread = threading.Thread(target=run_async_background)
-    thread.daemon = True # Ensure thread dies if main app dies
+    thread = threading.Thread(target=background_visit_task, args=(tokens, uid, server, config))
+    thread.daemon = True  # Ensure thread dies if main app dies
     thread.start()
 
     # Return IMMEDIATE response with 5x projection AND real info
